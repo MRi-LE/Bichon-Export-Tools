@@ -1,7 +1,12 @@
 # Bichon-Export-Tools
 **Authored by Michael (MRi-LE)**
 
+[![Blog](https://img.shields.io/badge/Read_The-Blog_Post-blue?style=for-the-badge&logo=ghost)](https://michaelrichter.online/bichon-a-lightweight-email-archiver/)
+
+
+
 Bichon Export Tool + Inspector with search capabilties due to lack of EML Export in Bichon
+
 
 
 ## 🚀 Key Features
@@ -16,8 +21,9 @@ Bichon Export Tool + Inspector with search capabilties due to lack of EML Export
 
 ## 📖 Usage
 
-1. Setup Environment
+
 ```bash
+1. Setup Environment
 python3 -m venv venv
 source venv/bin/activate
 pip install zstandard
