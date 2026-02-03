@@ -5,7 +5,7 @@
 
 
 
-Bichon Export Tool + Inspector with search capabilties due to lack of EML Export in Bichon
+Bichon Export Tool + Inspector with search capabilties due to current lack of EML Export in Bichon
 
 
 
@@ -24,17 +24,50 @@ Bichon Export Tool + Inspector with search capabilties due to lack of EML Export
 
 ```bash
 1. Setup Environment
+
 python3 -m venv venv
 source venv/bin/activate
 pip install zstandard
 
 2. Export Emails
-Edit the STORE_DIR and OUTPUT_FILE paths in bichon_mail_export.py, then run:
 
-Bash
-python3 bichon_mail_export.py
+$ python3 bichon_mail_export.py
+Version 1.5: Starting Recovery Engine...
+Phase 1: Decompressing .store files...
+13d8203e5c1548fbb3db76fbfc367d77.store
+   Added 3 potential email fragments.
+3e75823dafc84cdcbea042997e203d3c.store
+   Added 17851 potential email fragments.
+5cbc891ac2304fd8a6c6e9d58f062d4b.store
+   Added 4 potential email fragments.
+7ed490b08b444286bd17e8dc8c6e978c.store
+   Added 9 potential email fragments.
+
+Phase 2: Analyzing Identity & Owner...
+Detected Owner: mail@MRi-LE
+
+Phase 3: Parsing Headers & Deduplicating...
+   500 processed...
+   1000 processed...
+   1500 processed...
+   2000 processed...
+   2500 processed...
+   3000 processed...
+   3500 processed...
+   4000 processed...
+   4500 processed...
+   5000 processed...
+
+Phase 4: Fixing Dates & Exporting...
+
+ALL DONE!
+Final Archive: /mnt/ssd-pool/bichon/2026-02-03_bichon_5452_emails.tar.gz
+Total Unique Emails: 5452
+
+
 
 3. Inspect/Search Archive
+
 Use the inspector tool to verify your results:
 
 Bash
