@@ -7,6 +7,7 @@
 # Authored by Michael Richter, with assistance from AI tools.
 #
 # Version 1.4: Directional Logic Recovery + Content-Aware + (FROM/TO) + Owner detection 
+# Version 1.5: fixed Bug in (FROM/TO) + Process Stages 
 """
 
 import os
@@ -41,7 +42,8 @@ def decode_mime(text):
 
 def sanitize_name(name, length=25):
     if not name: return "UNKNOWN"
-    clean = re.sub(r'[^a-zA-Z0-9]', '_', str(name).split('@')[0])
+    name = re.sub(r'(?i)=\?utf-8\?[qb]\?.*?\?=', '', str(name))
+    clean = re.sub(r'[^a-zA-Z0-9]', '_', name.split('@')[0])
     return re.sub(r'_+', '_', clean).strip('_')[:length].upper()
 
 def extract_date(text):
@@ -59,39 +61,50 @@ def main():
     dctx = zstd.ZstdDecompressor(max_window_size=2**31)
     
     raw_parts = []
-    print(f"🚀 Version 1.4: Directional Logic Recovery...")
+    print(f"🚀 Version 1.5: Starting Recovery Engine...")
 
-    # 1. DECOMPRESS AND COLLECT
+    # --- PHASE 1: DECOMPRESSION ---
+    print("📂 Phase 1: Decompressing .store files...")
     for store_file in store_files:
+        print(f"📖 {store_file.name}")
         with open(store_file, 'rb') as f:
             raw_data = f.read()
+        
         full_buffer = b""
         chunks = raw_data.split(ZSTD_MAGIC)
         for chunk in chunks[1:]:
             try:
                 full_buffer += dctx.decompress(ZSTD_MAGIC + chunk, max_output_size=100*1024*1024)
             except: continue
+        
+        new_parts = re.split(b'\n(?=Return-Path:|Received:|X-Account-Key:|From: )', full_buffer)
+        raw_parts.extend(new_parts)
+        print(f"   ✨ Added {len(new_parts)} potential email fragments.")
 
-        raw_parts.extend(re.split(b'\n(?=Return-Path:|Received:|X-Account-Key:|From: )', full_buffer))
-
-    # 2. DYNAMIC OWNER DETECTION
-    # We look at the first 500 emails to see which address appears most in To/From
+    # --- PHASE 2: IDENTITY DETECTION ---
+    print("\n🔍 Phase 2: Analyzing Identity & Owner...")
     addr_counter = Counter()
-    for part in raw_parts[:500]:
+    for part in raw_parts[:1500]: 
         if len(part) < MIN_FILE_SIZE: continue
-        text = part[:10000].decode('utf-8', errors='ignore')
-        for pat in [r'(?i)^From:\s*(.*)', r'(?i)^To:\s*(.*)']:
-            m = re.search(pat, text, re.MULTILINE)
-            if m:
-                _, addr = parseaddr(m.group(1))
-                if addr: addr_counter[addr.lower()] += 1
+        text = part[:5000].decode('utf-8', errors='ignore')
+        if re.search(r'(?i)Michael|Richter', text):
+            f_match = re.search(r'(?i)^From:\s*(.*)', text, re.MULTILINE)
+            t_match = re.search(r'(?i)^To:\s*(.*)', text, re.MULTILINE)
+            for m in [f_match, t_match]:
+                if m:
+                    _, addr = parseaddr(m.group(1))
+                    if addr and ("michael" in addr.lower() or "richter" in addr.lower()):
+                        addr_counter[addr.lower()] += 1
     
-    owner_email = addr_counter.most_common(1)[0][0] if addr_counter else "unknown_owner"
-    print(f"👤 Detected Mailbox Owner: {owner_email}")
+    owner_email = addr_counter.most_common(1)[0][0] if addr_counter else "michael_richter"
+    print(f"👤 Detected Owner: {owner_email}")
 
-    # 3. PROCESS AND LABEL
+    # --- PHASE 3: PROCESSING ---
+    print("\n🛠️  Phase 3: Parsing Headers & Deduplicating...")
     final_emails = []
     seen_hashes = set()
+    proc_count = 0
+
     for part in raw_parts:
         if len(part) < MIN_FILE_SIZE: continue
         
@@ -100,7 +113,6 @@ def main():
         seen_hashes.add(content_hash)
 
         text_sample = part[:32000].decode('utf-8', errors='ignore')
-        
         f_date = extract_date(text_sample)
         subj_m = re.search(r'(?i)^Subject:\s*(.*)', text_sample, re.MULTILINE)
         from_m = re.search(r'(?i)^From:\s*(.*)', text_sample, re.MULTILINE)
@@ -109,32 +121,42 @@ def main():
         raw_from = (from_m.group(1) if from_m else "").lower()
         raw_to = (to_m.group(1) if to_m else "").lower()
         
-        if owner_email in raw_from:
-            direction, entity_raw = "TO", raw_to
+        is_sent_by_me = (owner_email in raw_from) or ("michael" in raw_from and "richter" in raw_from)
+        
+        if is_sent_by_me:
+            direction = "TO"
+            dest_raw = to_m.group(1) if to_m else "UNKNOWN_RECIPIENT"
         else:
-            direction, entity_raw = "FROM", raw_from
+            direction = "FROM"
+            dest_raw = from_m.group(1) if from_m else "UNKNOWN_SENDER"
 
-        entity = parseaddr(entity_raw)[0] or parseaddr(entity_raw)[1]
+        dest = parseaddr(dest_raw)[0] or parseaddr(dest_raw)[1]
 
         final_emails.append({
             'bytes': part,
             'date': f_date,
             'dir': direction,
-            'entity': sanitize_name(entity),
+            'entity': sanitize_name(dest),
             'subj': sanitize_name(decode_mime(subj_m.group(1))) if subj_m else "NOSUBJECT"
         })
+        
+        proc_count += 1
+        if proc_count % 500 == 0:
+            print(f"   ✨ {proc_count} processed...")
 
-    # 4. INTERPOLATION
+    # --- PHASE 4: INTERPOLATION & EXPORT ---
+    print("\n📅 Phase 4: Fixing Dates & Exporting...")
+    # Forward Pass
     last_date = "0000-00-00"
     for em in final_emails:
         if em['date']: last_date = em['date']
         else: em['date'] = last_date
+    # Backward Pass
     next_date = final_emails[-1]['date'] if final_emails else "0000-00-00"
     for em in reversed(final_emails):
         if em['date'] != "0000-00-00": next_date = em['date']
         elif em['date'] == "0000-00-00": em['date'] = next_date
 
-    # 5. FINAL EXPORT
     current_day = datetime.now().strftime('%Y-%m-%d')
     final_filename = f"{current_day}_bichon_{len(final_emails)}_emails.tar.gz"
     final_path = os.path.join(OUTPUT_DIR, final_filename)
@@ -146,8 +168,10 @@ def main():
             tar_info.size = len(em['bytes'])
             tar.addfile(tar_info, fileobj=io.BytesIO(em['bytes']))
 
-    print(f"\n🎉 Success! Archive created in your requested format.")
-    print(f"📁 File: {final_path}")
+    print(f"\n🎉 ALL DONE!")
+    print(f"📦 Final Archive: {final_path}")
+    print(f"📧 Total Unique Emails: {len(final_emails)}")
 
 if __name__ == "__main__":
     main()
+
