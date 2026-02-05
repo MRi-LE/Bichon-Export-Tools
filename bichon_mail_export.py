@@ -1,176 +1,206 @@
 #!/usr/bin/env python3
-
 """
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 MRi-LE
 # This software is provided "as is", without warranty of any kind.
 # Authored by Michael Richter, with assistance from AI tools.
-#
-# Version 1.4: Directional Logic Recovery + Content-Aware + (FROM/TO) + Owner detection 
-# Version 1.5: fixed Bug in (FROM/TO) + Process Stages 
+
+- Scans .store Zstd files recursively
+- Detects legit accounts (≥10% weight)
+- Matches emails to accounts via To/Delivered-To headers, with From-header fallback
+- Duplicates emails for multiple accounts
+- Produces dump.out and TAR.GZ archive
+- Staged progress output + summary table
+- Garbage / unknown emails tracked separately
 """
 
-import os
-import zstandard as zstd
-import tarfile
-import io
-import re
-import hashlib
+import os, re, sys, io, tarfile, hashlib, argparse
 from pathlib import Path
-from datetime import datetime
-from email.utils import parseaddr, parsedate_to_datetime
+from collections import Counter, defaultdict
+from email.utils import parseaddr, parsedate_to_datetime, formatdate
 from email.header import decode_header
-from collections import Counter
+from datetime import datetime
+import zstandard as zstd
 
-# === CONFIG ===
-STORE_DIR = "/mnt/ssd-pool/bichon/eml"
-OUTPUT_DIR = "/mnt/ssd-pool/bichon"
 ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
-MIN_FILE_SIZE = 2500 
 
-def decode_mime(text):
-    if not text: return ""
+# ---------------------- Utilities ----------------------
+def decode_mime_header(s):
+    if not s:
+        return ""
+    s = re.sub(r'[\r\n\t]+', ' ', s).strip()
     try:
-        decoded_parts = decode_header(text)
-        res = ""
-        for s, charset in decoded_parts:
-            if isinstance(s, bytes):
-                res += s.decode(charset or 'utf-8', errors='ignore')
-            else: res += s
-        return res
-    except: return text
+        parts = decode_header(s)
+        decoded = []
+        for content, charset in parts:
+            if isinstance(content, bytes):
+                decoded.append(content.decode(charset or 'utf-8', errors='ignore'))
+            else:
+                decoded.append(str(content))
+        return "".join(decoded).strip()
+    except:
+        return s
 
-def sanitize_name(name, length=25):
-    if not name: return "UNKNOWN"
-    name = re.sub(r'(?i)=\?utf-8\?[qb]\?.*?\?=', '', str(name))
-    clean = re.sub(r'[^a-zA-Z0-9]', '_', name.split('@')[0])
-    return re.sub(r'_+', '_', clean).strip('_')[:length].upper()
+def sanitize_name(text, length=40):
+    if not text:
+        return "UNK"
+    clean = re.sub(r'[^a-zA-Z0-9]', '_', text)
+    clean = re.sub(r'_+', '_', clean).strip('_')
+    return clean[:length].upper()
 
-def extract_date(text):
-    for pat in [r'(?i)^Date:\s*(.*)', r'(?i)^Received:.*?;([^\n]*)']:
-        matches = re.findall(pat, text, re.MULTILINE)
-        for m in reversed(matches):
-            try:
-                dt = parsedate_to_datetime(m.strip())
-                if 1990 < dt.year < 2030: return dt.strftime("%Y-%m-%d")
-            except: continue
-    return None
+def parse_date_from_headers(raw_bytes, fallback="0000-00-00"):
+    text = raw_bytes.decode('utf-8', errors='replace')
+    date_match = re.search(r'(?i)^(Date|Datum):\s*([^\r\n]+)', text, re.M)
+    if date_match:
+        try:
+            dt = parsedate_to_datetime(date_match.group(2).strip())
+            return dt.strftime("%Y-%m-%d")
+        except: pass
+    return fallback
 
-def main():
-    store_files = sorted(Path(STORE_DIR).glob("*.store"))
+# ---------------------- Account Detection ----------------------
+def detect_accounts(store_files):
+    tally = Counter()
     dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-    
-    raw_parts = []
-    print(f"🚀 Version 1.5: Starting Recovery Engine...")
+    print(f"🚀 Stage 1: Scanning {len(store_files)} .store files for account detection...")
 
-    # --- PHASE 1: DECOMPRESSION ---
-    print("📂 Phase 1: Decompressing .store files...")
-    for store_file in store_files:
-        print(f"📖 {store_file.name}")
-        with open(store_file, 'rb') as f:
-            raw_data = f.read()
-        
-        full_buffer = b""
-        chunks = raw_data.split(ZSTD_MAGIC)
-        for chunk in chunks[1:]:
-            try:
-                full_buffer += dctx.decompress(ZSTD_MAGIC + chunk, max_output_size=100*1024*1024)
-            except: continue
-        
-        new_parts = re.split(b'\n(?=Return-Path:|Received:|X-Account-Key:|From: )', full_buffer)
-        raw_parts.extend(new_parts)
-        print(f"   ✨ Added {len(new_parts)} potential email fragments.")
+    for sf in store_files:
+        with open(sf, 'rb') as f:
+            chunks = f.read().split(ZSTD_MAGIC)
+            for chunk in chunks[1:]:
+                try:
+                    dec = dctx.decompress(ZSTD_MAGIC + chunk, max_output_size=1024*1024)
+                    txt = dec.decode('utf-8', errors='ignore')
+                    to_addrs = re.findall(r'(?i)^(?:To|Delivered-To):\s*([^\n]+)', txt, re.MULTILINE)
+                    for addr_raw in to_addrs:
+                        _, addr = parseaddr(addr_raw)
+                        if addr and '@' in addr:
+                            addr_lower = addr.lower()
+                            tally.update([addr_lower])
+                except:
+                    continue
+    total = sum(tally.values())
+    accounts = [a for a, c in tally.items() if c / max(1, total) >= 0.10]
+    print(f"✅ Stage 1 complete: Detected legit accounts ≥10% weight: {accounts}\n")
+    return accounts
 
-    # --- PHASE 2: IDENTITY DETECTION ---
-    print("\n🔍 Phase 2: Analyzing Identity & Owner...")
-    addr_counter = Counter()
-    for part in raw_parts[:1500]: 
-        if len(part) < MIN_FILE_SIZE: continue
-        text = part[:5000].decode('utf-8', errors='ignore')
-        if re.search(r'(?i)Michael|Richter', text):
-            f_match = re.search(r'(?i)^From:\s*(.*)', text, re.MULTILINE)
-            t_match = re.search(r'(?i)^To:\s*(.*)', text, re.MULTILINE)
-            for m in [f_match, t_match]:
-                if m:
-                    _, addr = parseaddr(m.group(1))
-                    if addr and ("michael" in addr.lower() or "richter" in addr.lower()):
-                        addr_counter[addr.lower()] += 1
-    
-    owner_email = addr_counter.most_common(1)[0][0] if addr_counter else "michael_richter"
-    print(f"👤 Detected Owner: {owner_email}")
+# ---------------------- Email Extraction ----------------------
+def extract_emails(store_files, accounts):
+    dctx = zstd.ZstdDecompressor(max_window_size=2**31)
+    all_emails = []
+    dump_lines = []
+    acc_counts = Counter()
+    earliest_date = None
 
-    # --- PHASE 3: PROCESSING ---
-    print("\n🛠️  Phase 3: Parsing Headers & Deduplicating...")
-    final_emails = []
-    seen_hashes = set()
-    proc_count = 0
+    print(f"🚀 Stage 2: Extracting emails from .store files...")
 
-    for part in raw_parts:
-        if len(part) < MIN_FILE_SIZE: continue
-        
-        content_hash = hashlib.md5(part[-3000:]).hexdigest()
-        if content_hash in seen_hashes: continue
-        seen_hashes.add(content_hash)
+    for sf in store_files:
+        print(f"   📖 Processing {sf.name}...")
+        with open(sf, 'rb') as f:
+            chunks = f.read().split(ZSTD_MAGIC)
+            for chunk in chunks[1:]:
+                try:
+                    dec = dctx.decompress(ZSTD_MAGIC + chunk, max_output_size=200*1024*1024)
+                    positions = [m.start() for m in re.finditer(b'Return-Path:', dec)]
+                    positions.append(len(dec))
+                    for i in range(len(positions)-1):
+                        email_bytes = dec[positions[i]:positions[i+1]]
 
-        text_sample = part[:32000].decode('utf-8', errors='ignore')
-        f_date = extract_date(text_sample)
-        subj_m = re.search(r'(?i)^Subject:\s*(.*)', text_sample, re.MULTILINE)
-        from_m = re.search(r'(?i)^From:\s*(.*)', text_sample, re.MULTILINE)
-        to_m = re.search(r'(?i)^To:\s*(.*)', text_sample, re.MULTILINE)
+                        # Determine date
+                        date_str = parse_date_from_headers(email_bytes)
+                        if earliest_date is None or (date_str != "0000-00-00" and date_str < earliest_date):
+                            earliest_date = date_str
 
-        raw_from = (from_m.group(1) if from_m else "").lower()
-        raw_to = (to_m.group(1) if to_m else "").lower()
-        
-        is_sent_by_me = (owner_email in raw_from) or ("michael" in raw_from and "richter" in raw_from)
-        
-        if is_sent_by_me:
-            direction = "TO"
-            dest_raw = to_m.group(1) if to_m else "UNKNOWN_RECIPIENT"
-        else:
-            direction = "FROM"
-            dest_raw = from_m.group(1) if from_m else "UNKNOWN_SENDER"
+                        # Determine accounts
+                        text = email_bytes.decode('utf-8', errors='ignore').lower()
+                        matched_accounts = set()
+                        for acc in accounts:
+                            if acc.lower() in text:
+                                matched_accounts.add(acc)
+                        # Fallback: From header
+                        if not matched_accounts:
+                            from_m = re.search(r'(?i)^From:\s*([^\r\n]+)', text, re.MULTILINE)
+                            if from_m:
+                                _, addr = parseaddr(from_m.group(1))
+                                if addr and addr.lower() in accounts:
+                                    matched_accounts.add(addr.lower())
+                        if not matched_accounts:
+                            matched_accounts.add("UNK")
 
-        dest = parseaddr(dest_raw)[0] or parseaddr(dest_raw)[1]
+                        # Prepare dump_lines
+                        dump_lines.append(f"\n===== EMAIL {len(all_emails):05d} =====\nSIZE: {len(email_bytes)} bytes\nHASH: {hashlib.md5(email_bytes[:4096]).hexdigest()}\n--------------------------\n".encode('utf-8'))
+                        dump_lines.append(email_bytes)
 
-        final_emails.append({
-            'bytes': part,
-            'date': f_date,
-            'dir': direction,
-            'entity': sanitize_name(dest),
-            'subj': sanitize_name(decode_mime(subj_m.group(1))) if subj_m else "NOSUBJECT"
-        })
-        
-        proc_count += 1
-        if proc_count % 500 == 0:
-            print(f"   ✨ {proc_count} processed...")
+                        # Duplicate per account
+                        for acc in matched_accounts:
+                            all_emails.append({
+                                "bytes": email_bytes,
+                                "acc": acc.upper(),
+                                "date": date_str
+                            })
+                            acc_counts.update([acc.upper()])
 
-    # --- PHASE 4: INTERPOLATION & EXPORT ---
-    print("\n📅 Phase 4: Fixing Dates & Exporting...")
-    # Forward Pass
-    last_date = "0000-00-00"
-    for em in final_emails:
-        if em['date']: last_date = em['date']
-        else: em['date'] = last_date
-    # Backward Pass
-    next_date = final_emails[-1]['date'] if final_emails else "0000-00-00"
-    for em in reversed(final_emails):
-        if em['date'] != "0000-00-00": next_date = em['date']
-        elif em['date'] == "0000-00-00": em['date'] = next_date
+                except:
+                    continue
 
-    current_day = datetime.now().strftime('%Y-%m-%d')
-    final_filename = f"{current_day}_bichon_{len(final_emails)}_emails.tar.gz"
-    final_path = os.path.join(OUTPUT_DIR, final_filename)
+    return all_emails, dump_lines, acc_counts, earliest_date
 
-    with tarfile.open(final_path, "w:gz") as tar:
-        for i, em in enumerate(final_emails):
-            filename = f"{em['date']}_{em['dir']}_{em['entity']}_{em['subj']}_{i:05d}.eml"
-            tar_info = tarfile.TarInfo(name=filename)
-            tar_info.size = len(em['bytes'])
-            tar.addfile(tar_info, fileobj=io.BytesIO(em['bytes']))
+# ---------------------- Tarball Creation ----------------------
+def build_tarball(emails, output_path):
+    print(f"\n📦 Stage 4: Building TAR.GZ archive: {output_path}")
+    with tarfile.open(output_path, "w:gz") as tar:
+        for idx, em in enumerate(emails):
+            text = em["bytes"].decode('utf-8', errors='ignore')
+            subj_m = re.search(r'(?i)^Subject:\s*(.*?)(?=\r?\n[A-Z]|$)', text, re.M)
+            subj = decode_mime_header(subj_m.group(1)) if subj_m else "NO_SUBJECT"
+            clean_subj = sanitize_name(subj, 40)
 
-    print(f"\n🎉 ALL DONE!")
-    print(f"📦 Final Archive: {final_path}")
-    print(f"📧 Total Unique Emails: {len(final_emails)}")
+            # Filename: <ACCOUNT>_<DATE>_<FROM or TO>_<SENDER or RECEPIENT>_<SUBJECT>
+            from_m = re.search(r'(?i)^From:\s*([^\r\n]+)', text, re.M)
+            from_name = sanitize_name(parseaddr(from_m.group(1))[0]) if from_m else "UNK"
+            to_m = re.search(r'(?i)^(To|Delivered-To):\s*([^\r\n]+)', text, re.M)
+            to_name = sanitize_name(parseaddr(to_m.group(2))[0]) if to_m else "UNK"
+
+            fname = f"{em['acc']}_{em['date']}_{from_name}_{to_name}_{clean_subj}_{idx:05d}.eml"
+            ti = tarfile.TarInfo(name=fname)
+            ti.size = len(em["bytes"])
+            tar.addfile(ti, fileobj=io.BytesIO(em["bytes"]))
+
+# ---------------------- Main ----------------------
+def main():
+    parser = argparse.ArgumentParser(description="Bichon v93 Mail Export")
+    parser.add_argument("-p", "--path", required=True, help="Path to folder containing .store files")
+    args = parser.parse_args()
+
+    root = Path(args.path)
+    store_files = sorted(root.glob("*.store"))
+
+    # Stage 1: Account Detection
+    accounts = detect_accounts(store_files)
+
+    # Stage 2: Email Extraction
+    emails, dump_lines, acc_counts, earliest_date = extract_emails(store_files, accounts)
+
+    # Stage 3: Dump File
+    dump_file = root / "dump.out"
+    print(f"\n💾 Stage 3: Writing dump file: {dump_file}")
+    with open(dump_file, "wb") as df:
+        for line in dump_lines:
+            df.write(line if isinstance(line, bytes) else line.encode('utf-8'))
+
+    # Stage 4: Build Tarball
+    out_name = root / f"{earliest_date}_bichon_mail_export.tar.gz" if earliest_date else root / "bichon_mail_export.tar.gz"
+    build_tarball(emails, out_name)
+
+    # Stage 5: Summary Table
+    print(f"\n📊 Stage 5: Summary Table (Account Duplicates & Weights)")
+    total_emails = sum(acc_counts.values())
+    print(f"{'Account':<25}{'Emails':>8}{'Weight %':>12}")
+    print("-"*45)
+    for acc, count in acc_counts.most_common():
+        weight = (count / max(1, total_emails)) * 100
+        print(f"{acc:<25}{count:>8}{weight:>12.2f}%")
+    print(f"\n✅ Extraction Complete.\nDump: {dump_file}\nArchive: {out_name}")
 
 if __name__ == "__main__":
     main()
