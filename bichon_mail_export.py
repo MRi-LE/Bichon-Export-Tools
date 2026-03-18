@@ -720,7 +720,7 @@ def main():
 
     # ---------------- Stage 6: tar.gz ----------------
     earliest = min([r["date"] for r in carved_msgs if r["date"] != "0000-00-00"], default="0000-00-00")
-    tar_path = outdir / f"{earliest}_bichon_mail_export.tar.gz"
+    tar_path = outdir / f"{outdir.name}_bichon_mail_export.tar.gz"
     if not args.no_tar:
         with tarfile.open(tar_path, "w:gz") as tar:
             for p in sorted(eml_root.rglob("*.eml")):
