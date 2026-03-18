@@ -3,17 +3,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 MRi-LE
 # This software is provided "as is", without warranty of any kind.
-# Authored by Michael Richter, with assistance from AI tools.
+# Authored by MRi-LE, with assistance from AI tools.
+
+Bichon Email Export Pipeline
+Forensic carving of Zstandard-compressed mail store files with
+strict top-level message validation, deduplication, account assignment,
+and auditable CSV outputs.
 
 FIX INCLUDED:
 - Carving now "jumps past header end" after accepting a message start
   to avoid splitting inside a single message header (Date/Message-ID/From).
 
 Goals:
-- get close to original ~7800 by carving ONLY top-level messages
+- get close to original Email Count by carving ONLY top-level messages
 - avoid DKIM/ARC "Subject:Date;" false positives
 - avoid forwarded/quoted embedded headers being counted as messages
 - produce full debug artifacts for forensic tuning
+- detect multiple mailbox accounts & duplicate messages into per-account folders
+- reduce residual UNK via conservative provider-alias normalization
 
 Stages:
 1) Discover .store files recursively
@@ -22,18 +29,19 @@ Stages:
    - Tier1: Return-Path segmentation (primary)
    - Tier2: strict top-level header blocks inside frames/segments
 4) Dedupe by Message-ID else by strong hash fingerprint
-5) Build clean_emails.csv
-6) Reconstruct .eml files + tar.gz
-7) Summary + debug reports
+5) Build clean_emails.csv (deduped canonical messages)
+6) Account detection + account assignment CSVs
+7) Reconstruct .eml files into reconstructed/<ACCOUNT>/... (+ optional tar.gz)
+8) Summary + debug reports
 
 Usage:
-  python3 bichon_mail_export.py -p /../../bichon/eml --max-bytes $((200*1024*1024))
+  python3 bichon_mail_export.py -p /<path2eml>
 """
 
 import os, re, sys, io, csv, tarfile, hashlib, argparse
 from pathlib import Path
 from collections import Counter
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime, getaddresses
 from email.header import decode_header
 from datetime import datetime
 import zstandard as zstd
@@ -75,6 +83,7 @@ RX_BAD_PREFIX = re.compile(
 RX_START = re.compile(br"(?im)^(return-path|from|message-id|date):\s+")
 RX_FROM = re.compile(br"(?im)^from:\s*(.+)$")
 RX_TO = re.compile(br"(?im)^(to|delivered-to):\s*(.+)$")
+RX_CC = re.compile(br"(?im)^cc:\s*(.+)$")
 RX_DATE = re.compile(br"(?im)^(date|datum):\s*(.+)$")
 RX_SUBJ = re.compile(br"(?im)^subject:\s*(.*)$")
 RX_MID  = re.compile(br"(?im)^message-id:\s*(.+)$")
@@ -83,7 +92,6 @@ CORE_HEADER_RXS = [RX_FROM, RX_TO, RX_DATE, RX_MID]  # subject optional
 
 def looks_quoted_or_forwarded_context(b: bytes, pos: int) -> bool:
     pre = b[max(0, pos-260):pos].lower()
-    # Common quote markers / forward separators
     if b"\n>" in pre or pre.endswith(b">") or b"\n|" in pre:
         return True
     if b"original message" in pre or b"forwarded message" in pre or b"weitergeleitete nachricht" in pre:
@@ -98,12 +106,9 @@ def parse_top_header_block(b: bytes, start: int, max_scan: int = 128*1024):
     if start < 0 or start >= len(b):
         return None, -1
 
-    # Top-level boundary heuristic (keep as in your gold; can tighten later)
     if start != 0:
-        # prefer blank-line boundary but don't hard-fail here (we can tighten later if needed)
         pass
 
-    # reject quoted/forwarded contexts
     if looks_quoted_or_forwarded_context(b, start):
         return None, -1
 
@@ -113,12 +118,10 @@ def parse_top_header_block(b: bytes, start: int, max_scan: int = 128*1024):
         return None, -1
     header = tail[:m.start()+2]  # includes "\n\n"
 
-    # header must not start as DKIM/ARC blocks
     head_first = header[:4096]
     if RX_BAD_PREFIX.search(head_first):
         return None, -1
 
-    # Require at least 3 of the core headers (From/To(or Delivered-To)/Date/Message-ID)
     hits = 0
     for rx in CORE_HEADER_RXS:
         if rx.search(header):
@@ -126,7 +129,6 @@ def parse_top_header_block(b: bytes, start: int, max_scan: int = 128*1024):
     if hits < 3:
         return None, -1
 
-    # must contain a plausible From:
     fm = RX_FROM.search(header)
     if not fm:
         return None, -1
@@ -135,13 +137,19 @@ def parse_top_header_block(b: bytes, start: int, max_scan: int = 128*1024):
 
 def parse_header_fields(header: bytes) -> dict:
     s = header.decode("latin-1", errors="replace")
-    out = {"from": "", "to": "", "date": "", "subject": "", "message_id": ""}
+    out = {
+        "from": "", "to": "", "cc": "", "rcpt_hints": "",
+        "date": "", "subject": "", "message_id": "",
+    }
 
     m = re.search(r"(?im)^from:\s*(.+)$", s)
     if m: out["from"] = m.group(1).strip()
 
     m = re.search(r"(?im)^(to|delivered-to):\s*(.+)$", s)
     if m: out["to"] = m.group(2).strip()
+
+    m = re.search(r"(?im)^cc:\s*(.+)$", s)
+    if m: out["cc"] = m.group(1).strip()
 
     m = re.search(r"(?im)^(date|datum):\s*(.+)$", s)
     if m: out["date"] = m.group(2).strip()
@@ -171,6 +179,187 @@ def strong_fingerprint(header: bytes, body_prefix: bytes) -> str:
     h.update(b"\n--BODY--\n")
     h.update(body_prefix[:4096])
     return h.hexdigest()
+
+# ---------------------- Account helpers ----------------------
+
+def canonicalize_email(addr: str) -> str:
+    addr = (addr or "").strip().lower()
+    if "@" not in addr:
+        return addr
+    local, dom = addr.split("@", 1)
+
+    # Canonical mappings already proven useful in this dataset
+    if dom == "gmx.net":
+        dom = "gmx.de"
+    elif dom == "01019freenet.de":
+        dom = "freenet.de"
+
+    return f"{local}@{dom}"
+
+def extract_emails_from_header_value(v: str) -> list[str]:
+    """
+    Parse a header value that may contain multiple addresses.
+    Returns canonicalized email addresses only.
+    """
+    if not v:
+        return []
+    addrs = []
+    for _name, addr in getaddresses([v]):
+        addr = canonicalize_email(addr)
+        if addr and "@" in addr:
+            addrs.append(addr)
+    return addrs
+
+def domain_of(addr: str) -> str:
+    addr = canonicalize_email(addr)
+    if "@" not in addr:
+        return ""
+    return addr.split("@", 1)[1]
+
+def localpart_of(addr: str) -> str:
+    addr = canonicalize_email(addr)
+    if "@" not in addr:
+        return ""
+    return addr.split("@", 1)[0]
+
+def build_account_domain_index(accounts: list[str]) -> dict[str, list[str]]:
+    idx = {}
+    for acc in accounts:
+        a = canonicalize_email(acc)
+        d = domain_of(a)
+        idx.setdefault(d, []).append(a)
+    return idx
+
+def normalize_provider_alias(addr: str, accounts: list[str]) -> str | None:
+    """
+    Conservative provider-alias normalization.
+
+    Currently supported:
+    - GMX masked rcpt aliases like '#123456@gmx.de'
+      -> canonical detected GMX account, but only if exactly one exists.
+    - disable or alter if requried
+
+    Returns canonical account or None.
+    """
+    addr = canonicalize_email(addr)
+    if "@" not in addr:
+        return None
+
+    lp = localpart_of(addr)
+    dom = domain_of(addr)
+
+    acc_by_dom = build_account_domain_index(accounts)
+
+    if dom in ("gmx.de", "gmx.net") and lp.startswith("#"):
+        gmx_accounts = []
+        gmx_accounts.extend(acc_by_dom.get("gmx.de", []))
+        gmx_accounts.extend(acc_by_dom.get("gmx.net", []))
+        gmx_accounts = sorted(set(gmx_accounts))
+        if len(gmx_accounts) == 1:
+            return gmx_accounts[0]
+
+    return None
+
+RX_ENV_TO = re.compile(r"(?im)^envelope-to:\s*<?([^>\r\n]+)>?")
+RX_X_ORIG_TO = re.compile(r"(?im)^x-original-to:\s*<?([^>\r\n]+)>?")
+RX_DELIV_TO = re.compile(r"(?im)^delivered-to:\s*<?([^>\r\n]+)>?")
+RX_RECEIVED_FOR = re.compile(r"(?im)^received:.*?\bfor\s+<([^>\r\n]+)>", re.S)
+
+def extract_rcpt_hints(raw_msg: bytes) -> list[str]:
+    """
+    Extract recipient hints from top-level transport headers only.
+    Conservative: only Envelope-To / X-Original-To / Delivered-To / Received ... for <...>
+    """
+    b = normalize_newlines(raw_msg)
+    header, _hdr_end = parse_top_header_block(b, 0)
+    if header is None:
+        # fallback: inspect first header-looking block from raw start
+        m = RX_HDR_END.search(b[:128*1024])
+        if not m:
+            return []
+        header = b[:m.start()+2]
+
+    s = header.decode("latin-1", errors="replace")
+    hits = []
+
+    for rx in (RX_ENV_TO, RX_X_ORIG_TO, RX_DELIV_TO):
+        for m in rx.finditer(s):
+            addr = canonicalize_email(m.group(1))
+            if addr and "@" in addr:
+                hits.append(addr)
+
+    for m in RX_RECEIVED_FOR.finditer(s):
+        addr = canonicalize_email(m.group(1))
+        if addr and "@" in addr:
+            hits.append(addr)
+
+    out = []
+    seen = set()
+    for a in hits:
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
+
+def detect_accounts_from_carved_rows(rows: list[dict], min_weight: float) -> list[str]:
+    """
+    Detect legit mailbox accounts based on recipient-facing header signals.
+    Uses To + Cc + rcpt_hints.
+    """
+    tally = Counter()
+    for r in rows:
+        for hdr in (r.get("to",""), r.get("cc",""), r.get("rcpt_hints","")):
+            for addr in extract_emails_from_header_value(hdr):
+                tally.update([addr])
+
+    total = sum(tally.values())
+    if total <= 0:
+        return []
+
+    accounts = []
+    for addr, c in tally.most_common():
+        if c / total >= min_weight:
+            accounts.append(addr)
+
+    return accounts
+
+def assign_accounts_for_message(r: dict, accounts: list[str]) -> list[str]:
+    """
+    Match a message to one or more accounts:
+    - direct match if any known account appears in To/Cc
+    - direct match from rcpt_hints
+    - conservative provider-alias normalization from rcpt_hints
+    - fallback: From matches known account
+    - else: UNK
+    """
+    acc_set = set(canonicalize_email(a) for a in accounts)
+    matched = set()
+
+    for hdr in (r.get("to",""), r.get("cc","")):
+        for addr in extract_emails_from_header_value(hdr):
+            if addr in acc_set:
+                matched.add(addr)
+
+    if not matched:
+        for addr in extract_emails_from_header_value(r.get("rcpt_hints","")):
+            if addr in acc_set:
+                matched.add(addr)
+
+    if not matched:
+        for addr in extract_emails_from_header_value(r.get("rcpt_hints","")):
+            canon = normalize_provider_alias(addr, accounts)
+            if canon and canon in acc_set:
+                matched.add(canon)
+
+    if not matched:
+        _n, frm = parseaddr(r.get("from","") or "")
+        frm = canonicalize_email(frm)
+        if frm and frm in acc_set:
+            matched.add(frm)
+
+    if not matched:
+        return ["UNK"]
+    return sorted(matched)
 
 # ---------------------- Store/frame reading ----------------------
 
@@ -212,17 +401,13 @@ def carve_messages_from_blob(blob: bytes) -> list[tuple[int, bytes]]:
             continue
 
         starts.append(s)
-
-        # CRITICAL FIX: jump past the end of the header block
         pos = max(hdr_end, s + 1)
 
     if not starts:
         return []
 
-    # Deduplicate + sort
     starts = sorted(set(starts))
 
-    # Build message slices
     for i, s in enumerate(starts):
         e = starts[i+1] if i+1 < len(starts) else len(b)
         msg = b[s:e].strip(b"\n")
@@ -251,6 +436,7 @@ def main():
     ap.add_argument("--max-bytes", type=int, default=200*1024*1024, help="Max decompressed bytes per frame")
     ap.add_argument("--write-frames", action="store_true", help="Write decompressed frames for debugging (large!)")
     ap.add_argument("--no-tar", action="store_true", help="Skip tar.gz creation")
+    ap.add_argument("--account-min-weight", type=float, default=0.10, help="Min weight (0..1) to treat an address as a legit account")
     args = ap.parse_args()
 
     root = Path(args.path)
@@ -258,14 +444,16 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     seg_dir = outdir / "segments"
-    eml_dir = outdir / "reconstructed"
+    eml_root = outdir / "reconstructed"
     dbg_dir = outdir / "debug"
-    for d in (seg_dir, eml_dir, dbg_dir):
+    for d in (seg_dir, eml_root, dbg_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     frame_csv = outdir / "frames_report.csv"
     carve_csv = outdir / "carve_report.csv"
     clean_csv = outdir / "clean_emails.csv"
+    accounts_csv = outdir / "clean_emails_accounts.csv"
+    accounts_summary_csv = outdir / "accounts_summary.csv"
     summary_txt = outdir / "summary.txt"
     dump_path = outdir / "dump.out"
 
@@ -273,7 +461,7 @@ def main():
     dctx = zstd.ZstdDecompressor(max_window_size=2**31)
 
     # ---------------- Stage 1: frames report ----------------
-    all_frames = []  # list of dicts
+    all_frames = []
     with frame_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["store_file","frame_index","frame_bytes","decompressed_bytes","decompress_ok","has_return_path"])
@@ -296,7 +484,7 @@ def main():
                         (dbg_dir / f"frame_{sf.stem}_{idx:04d}.bin").write_bytes(dec)
 
     # ---------------- Stage 2: carve ----------------
-    carved_msgs = []  # dict records
+    carved_msgs = []
     fp_seen = set()
     mid_seen = set()
 
@@ -305,21 +493,20 @@ def main():
         w.writerow([
             "store_file","frame_index","tier","start_offset",
             "bytes","has_return_path","accepted",
-            "reason","message_id","date_ymd","from","to","subject"
+            "reason","message_id","date_ymd","from","to","cc","rcpt_hints","subject"
         ])
 
         for fr in all_frames:
             dec = fr["dec"]
             b = normalize_newlines(dec)
 
-            # Tier1: RP split (if present)
             tier1 = tier1_return_path_split(b)
             if tier1:
                 for seg in tier1:
                     msgs = carve_messages_from_blob(seg)
                     if not msgs:
                         w.writerow([fr["store"].name, fr["frame_index"], "tier2_in_tier1", -1, len(seg), int(fr["has_rp"]), 0,
-                                    "no_strict_headers", "", "", "", "", ""])
+                                    "no_strict_headers", "", "", "", "", "", "", ""])
                         continue
 
                     seg_norm = normalize_newlines(seg)
@@ -327,10 +514,11 @@ def main():
                         header, hdr_end = parse_top_header_block(seg_norm, start)
                         if header is None:
                             w.writerow([fr["store"].name, fr["frame_index"], "tier2_in_tier1", start, len(msg), int(fr["has_rp"]), 0,
-                                        "validator_reject", "", "", "", "", ""])
+                                        "validator_reject", "", "", "", "", "", "", ""])
                             continue
 
                         fields = parse_header_fields(header)
+                        rcpt_hints = ",".join(extract_rcpt_hints(msg))
                         mid = (fields["message_id"] or "").strip().lower()
                         ymd = date_to_ymd(fields["date"])
                         fp = mid if mid else strong_fingerprint(header, msg[hdr_end-start:])
@@ -354,6 +542,8 @@ def main():
                                 "segment_file": seg_name,
                                 "from": fields["from"],
                                 "to": fields["to"],
+                                "cc": fields.get("cc",""),
+                                "rcpt_hints": rcpt_hints,
                                 "date": ymd,
                                 "subject": fields["subject"],
                                 "message_id": fields["message_id"],
@@ -366,19 +556,19 @@ def main():
                         w.writerow([
                             fr["store"].name, fr["frame_index"], "tier2_in_tier1", start, len(msg),
                             int(fr["has_rp"]), accepted, reason,
-                            fields["message_id"], ymd, fields["from"], fields["to"], fields["subject"]
+                            fields["message_id"], ymd, fields["from"], fields["to"], fields.get("cc",""), rcpt_hints, fields["subject"]
                         ])
             else:
-                # No RP: carve directly from frame with strict headers
                 msgs = carve_messages_from_blob(b)
                 for start, msg in msgs:
                     header, hdr_end = parse_top_header_block(b, start)
                     if header is None:
                         w.writerow([fr["store"].name, fr["frame_index"], "tier2_no_rp", start, len(msg), 0, 0,
-                                    "validator_reject", "", "", "", "", ""])
+                                    "validator_reject", "", "", "", "", "", "", ""])
                         continue
 
                     fields = parse_header_fields(header)
+                    rcpt_hints = ",".join(extract_rcpt_hints(msg))
                     mid = (fields["message_id"] or "").strip().lower()
                     ymd = date_to_ymd(fields["date"])
                     fp = mid if mid else strong_fingerprint(header, msg[hdr_end-start:])
@@ -402,6 +592,8 @@ def main():
                             "segment_file": seg_name,
                             "from": fields["from"],
                             "to": fields["to"],
+                            "cc": fields.get("cc",""),
+                            "rcpt_hints": rcpt_hints,
                             "date": ymd,
                             "subject": fields["subject"],
                             "message_id": fields["message_id"],
@@ -414,7 +606,7 @@ def main():
                     w.writerow([
                         fr["store"].name, fr["frame_index"], "tier2_no_rp", start, len(msg),
                         0, accepted, reason,
-                        fields["message_id"], ymd, fields["from"], fields["to"], fields["subject"]
+                        fields["message_id"], ymd, fields["from"], fields["to"], fields.get("cc",""), rcpt_hints, fields["subject"]
                     ])
 
     # ---------------- Stage 3: dump.out ----------------
@@ -429,10 +621,10 @@ def main():
             df.write(seg)
             df.write(b"\n")
 
-    # ---------------- Stage 4: clean_emails.csv ----------------
+    # ---------------- Stage 4: clean_emails.csv (canonical) ----------------
     with clean_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=[
-            "segment_file","from","to","date","subject","message_id","mode",
+            "segment_file","from","to","cc","rcpt_hints","date","subject","message_id","mode",
             "classification","size","store_file","frame_index","tier"
         ])
         w.writeheader()
@@ -441,6 +633,8 @@ def main():
                 "segment_file": r["segment_file"],
                 "from": r["from"],
                 "to": r["to"],
+                "cc": r.get("cc",""),
+                "rcpt_hints": r.get("rcpt_hints",""),
                 "date": r["date"],
                 "subject": r["subject"],
                 "message_id": r["message_id"],
@@ -452,8 +646,52 @@ def main():
                 "tier": r["tier"],
             })
 
-    # ---------------- Stage 5: reconstruct eml ----------------
+    # ---------------- Stage 4b: detect accounts ----------------
+    accounts = detect_accounts_from_carved_rows(carved_msgs, args.account_min_weight)
+
+    # ---------------- Stage 4c: account assignment CSV ----------------
+    acc_counts = Counter()
+    with accounts_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "segment_file","account","from","to","cc","rcpt_hints","date","subject","message_id",
+            "size","store_file","frame_index","tier"
+        ])
+        w.writeheader()
+
+        for r in carved_msgs:
+            for acc in assign_accounts_for_message(r, accounts):
+                acc_counts.update([acc])
+                w.writerow({
+                    "segment_file": r["segment_file"],
+                    "account": acc,
+                    "from": r["from"],
+                    "to": r["to"],
+                    "cc": r.get("cc",""),
+                    "rcpt_hints": r.get("rcpt_hints",""),
+                    "date": r["date"],
+                    "subject": r["subject"],
+                    "message_id": r["message_id"],
+                    "size": r["size"],
+                    "store_file": r["store_file"],
+                    "frame_index": r["frame_index"],
+                    "tier": r["tier"],
+                })
+
+    with accounts_summary_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["account","emails","weight_percent"])
+        total_assigned = sum(acc_counts.values()) or 1
+        for acc, c in acc_counts.most_common():
+            w.writerow([acc, c, round((c/total_assigned)*100.0, 2)])
+
+    # ---------------- Stage 5: reconstruct eml per account ----------------
     no_subject = 0
+    total_written = 0
+
+    msg_accounts = []
+    for r in carved_msgs:
+        msg_accounts.append(assign_accounts_for_message(r, accounts))
+
     for idx, r in enumerate(carved_msgs, start=1):
         seg = (seg_dir / r["segment_file"]).read_bytes()
 
@@ -461,17 +699,33 @@ def main():
         if subj == "NO_SUBJECT":
             no_subject += 1
 
-        frm = sanitize_name(parseaddr(r["from"])[1] or parseaddr(r["from"])[0] or "UNK", 30)
+        frm_email = parseaddr(r["from"])[1] or parseaddr(r["from"])[0] or "UNK"
+        frm = sanitize_name(frm_email, 30)
         dt = r["date"] or "0000-00-00"
-        fn = f"{idx:06d}_{dt}_{frm}_{sanitize_name(subj,60)}.eml"
-        (eml_dir / fn).write_bytes(seg)
+        base = f"{idx:06d}_{dt}_{frm}_{sanitize_name(subj,60)}"
+
+        accs = msg_accounts[idx-1]
+        if not accs:
+            accs = ["UNK"]
+
+        for a_i, acc in enumerate(accs, start=1):
+            acc_dir_name = sanitize_name(acc, 80) if acc != "UNK" else "UNK"
+            acc_dir = eml_root / acc_dir_name
+            acc_dir.mkdir(parents=True, exist_ok=True)
+
+            suffix = f"_A{a_i:02d}" if len(accs) > 1 else ""
+            fn = f"{base}{suffix}.eml"
+            (acc_dir / fn).write_bytes(seg)
+            total_written += 1
 
     # ---------------- Stage 6: tar.gz ----------------
-    tar_path = outdir / f"{min([r['date'] for r in carved_msgs if r['date']!='0000-00-00'], default='0000-00-00')}_bichon_mail_export.tar.gz"
+    earliest = min([r["date"] for r in carved_msgs if r["date"] != "0000-00-00"], default="0000-00-00")
+    tar_path = outdir / f"{earliest}_bichon_mail_export.tar.gz"
     if not args.no_tar:
         with tarfile.open(tar_path, "w:gz") as tar:
-            for p in sorted(eml_dir.glob("*.eml")):
-                ti = tarfile.TarInfo(name=p.name)
+            for p in sorted(eml_root.rglob("*.eml")):
+                arcname = str(p.relative_to(outdir))
+                ti = tarfile.TarInfo(name=arcname)
                 data = p.read_bytes()
                 ti.size = len(data)
                 tar.addfile(ti, fileobj=io.BytesIO(data))
@@ -479,16 +733,21 @@ def main():
     # ---------------- Summary ----------------
     total = len(carved_msgs)
     missing_subj = sum(1 for r in carved_msgs if not (r["subject"] or "").strip())
+
     with summary_txt.open("w", encoding="utf-8") as f:
-        f.write("Bichon Gold Pipeline Summary (jump past header end)\n")
+        f.write("Bichon Email Export Pipeline Summary (jump past header end + multi-account + rcpt_hints + GMX alias normalization)\n")
         f.write(f"Output dir: {outdir}\n")
         f.write(f"Store files: {len(store_files)}\n")
         f.write(f"Frames: {len(all_frames)}\n")
         f.write(f"Carved messages (deduped): {total}\n")
         f.write(f"Missing Subject (real): {missing_subj}\n")
-        f.write(f"NO_SUBJECT EMLs: {no_subject}\n")
+        f.write(f"NO_SUBJECT (real): {no_subject}\n")
+        f.write(f"Accounts detected (min_weight={args.account_min_weight}): {accounts}\n")
+        f.write(f"EMLs written (with duplication): {total_written}\n")
         f.write(f"Dump: {dump_path}\n")
-        f.write(f"CSV: {clean_csv}\n")
+        f.write(f"CSV (canonical): {clean_csv}\n")
+        f.write(f"CSV (accounts): {accounts_csv}\n")
+        f.write(f"Accounts summary: {accounts_summary_csv}\n")
         f.write(f"Frames report: {frame_csv}\n")
         f.write(f"Carve report: {carve_csv}\n")
         if not args.no_tar:
@@ -498,8 +757,13 @@ def main():
     print(f"Output dir: {outdir}")
     print(f"Carved (deduped): {total}")
     print(f"Missing real Subject: {missing_subj}")
-    print(f"NO_SUBJECT EMLs: {no_subject}")
-    print(f"CSV: {clean_csv}")
+    print(f"NO_SUBJECT (real): {no_subject}")
+    print(f"Accounts detected (min_weight={args.account_min_weight}): {accounts}")
+    print(f"EMLs written (with duplication): {total_written}")
+    print(f"Reconstructed root: {eml_root}")
+    print(f"CSV (canonical): {clean_csv}")
+    print(f"CSV (accounts): {accounts_csv}")
+    print(f"Accounts summary: {accounts_summary_csv}")
     print(f"Frames report: {frame_csv}")
     print(f"Carve report: {carve_csv}")
     print(f"Dump: {dump_path}")
